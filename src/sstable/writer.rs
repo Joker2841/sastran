@@ -16,6 +16,7 @@ use std::path::Path;
 
 use super::{
     BloomFilter, DATA_BLOCK_TARGET_SIZE, FOOTER_LEN, FOOTER_MAGIC, KIND_DELETE, KIND_PUT,
+    KIND_VECTOR,
 };
 
 /// Builds an SSTable from a sorted stream of entries.
@@ -185,6 +186,7 @@ impl SsTableWriter {
 fn encoded_entry_size(key: &[u8], entry: &Entry) -> usize {
     let value_len = match entry {
         Entry::Put(v) => v.len(),
+        Entry::Vector(v) => v.len(),
         Entry::Tombstone => 0,
     };
     4 + 4 + 1 + key.len() + value_len
@@ -193,6 +195,7 @@ fn encoded_entry_size(key: &[u8], entry: &Entry) -> usize {
 fn encode_entry(key: &[u8], entry: &Entry, out: &mut Vec<u8>) {
     let (kind_byte, value): (u8, &[u8]) = match entry {
         Entry::Put(v) => (KIND_PUT, v.as_slice()),
+        Entry::Vector(v) => (KIND_VECTOR, v.as_slice()),
         Entry::Tombstone => (KIND_DELETE, &[]),
     };
     out.extend_from_slice(&(key.len() as u32).to_le_bytes());

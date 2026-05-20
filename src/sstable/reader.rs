@@ -12,7 +12,7 @@ use crate::{Error, Result};
 use std::path::Path;
 use std::sync::Arc;
 
-use super::{FOOTER_LEN, FOOTER_MAGIC, KIND_DELETE, KIND_PUT};
+use super::{FOOTER_LEN, FOOTER_MAGIC, KIND_DELETE, KIND_PUT, KIND_VECTOR};
 
 /// Result of a point lookup. Mirrors [`crate::memtable::Lookup`] but
 /// returns owned bytes, since the data was just read from disk.
@@ -246,6 +246,7 @@ impl SsTableIterator {
         let value_bytes = &block[body_start + key_len..body_end];
         let entry = match kind {
             KIND_PUT => Entry::Put(value_bytes.to_vec()),
+            KIND_VECTOR => Entry::Vector(value_bytes.to_vec()),
             KIND_DELETE => Entry::Tombstone,
             other => {
                 return Err(Error::Corruption(format!(
@@ -388,7 +389,7 @@ fn scan_block_for_key(block: &[u8], target: &[u8]) -> Result<SsTableLookup> {
         if key_bytes == target {
             let value_bytes = &block[p + key_len..p + key_len + value_len];
             return match kind {
-                KIND_PUT => Ok(SsTableLookup::Found(value_bytes.to_vec())),
+                KIND_PUT | KIND_VECTOR => Ok(SsTableLookup::Found(value_bytes.to_vec())),
                 KIND_DELETE => Ok(SsTableLookup::Deleted),
                 other => Err(Error::Corruption(format!(
                     "unknown SSTable entry kind {other:#04x}"
@@ -695,5 +696,37 @@ mod tests {
         assert!(matches!(first, Err(Error::Corruption(_))));
         assert!(it.next().is_none());
         assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn iter_yields_vector_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sst.bin");
+        let entries: Vec<(Vec<u8>, Entry)> = vec![
+            (b"a".to_vec(), Entry::Put(b"plain".to_vec())),
+            (b"b".to_vec(), Entry::Vector(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+            (b"c".to_vec(), Entry::Tombstone),
+        ];
+        build_sst(&path, &entries);
+
+        let fs = StdFs::new();
+        let r = SsTableReader::open(&fs, &path).unwrap();
+        let got: Vec<(Vec<u8>, Entry)> = r
+            .iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(got, entries);
+    }
+
+    #[test]
+    fn get_returns_bytes_for_vector_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sst.bin");
+        let v = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        build_sst(&path, &[(b"k".to_vec(), Entry::Vector(v.clone()))]);
+
+        let fs = StdFs::new();
+        let r = SsTableReader::open(&fs, &path).unwrap();
+        assert_eq!(r.get(b"k").unwrap(), SsTableLookup::Found(v));
     }
 }

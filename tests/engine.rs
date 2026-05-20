@@ -556,3 +556,886 @@ fn post_compaction_l0_files_survive_reopen() {
         );
     }
 }
+
+#[test]
+fn put_indexed_then_get_returns_vector_bytes() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+
+    let embedding = vec![0.1f32, 0.2, 0.3, 0.4];
+    engine.put_indexed(b"mem_1", &embedding).unwrap();
+
+    let got = engine.get(b"mem_1").unwrap().expect("key should exist");
+    // The bytes are the little-endian f32 encoding.
+    let mut expected = Vec::new();
+    for x in &embedding {
+        expected.extend_from_slice(&x.to_le_bytes());
+    }
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn put_indexed_rejects_empty_embedding() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let err = engine.put_indexed(b"k", &[]).unwrap_err();
+    assert!(matches!(err, sastran::Error::InvalidArgument(_)));
+}
+
+#[test]
+fn put_indexed_rejects_non_finite() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let err = engine.put_indexed(b"k", &[1.0, f32::NAN]).unwrap_err();
+    assert!(matches!(err, sastran::Error::InvalidArgument(_)));
+    let err = engine.put_indexed(b"k", &[f32::INFINITY, 0.0]).unwrap_err();
+    assert!(matches!(err, sastran::Error::InvalidArgument(_)));
+}
+
+#[test]
+fn put_indexed_then_delete_masks_correctly() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"k", &[0.1, 0.2]).unwrap();
+    engine.delete(b"k").unwrap();
+    assert_eq!(engine.get(b"k").unwrap(), None);
+}
+
+#[test]
+fn put_indexed_can_be_overwritten_by_put() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"k", &[0.1, 0.2]).unwrap();
+    engine.put(b"k", b"plain bytes now").unwrap();
+    assert_eq!(engine.get(b"k").unwrap(), Some(b"plain bytes now".to_vec()));
+}
+
+#[test]
+fn put_indexed_survives_reopen_via_wal_replay() {
+    let dir = tempdir().unwrap();
+    let embedding = vec![0.5f32, -0.5, 0.25, -0.25];
+    {
+        let engine = Engine::open(Options::new(dir.path())).unwrap();
+        engine.put_indexed(b"persist", &embedding).unwrap();
+        engine.close().unwrap();
+    }
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let got = engine.get(b"persist").unwrap().expect("key should persist");
+    let mut expected = Vec::new();
+    for x in &embedding {
+        expected.extend_from_slice(&x.to_le_bytes());
+    }
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn put_indexed_survives_flush_via_sstable() {
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1; // every write triggers flush
+    let engine = Engine::open(options).unwrap();
+
+    let embedding = vec![0.1f32, 0.2, 0.3];
+    engine.put_indexed(b"sst_vec", &embedding).unwrap();
+
+    // Force a manual flush in case the threshold didn't fire.
+    engine.flush().unwrap();
+    let (l0, _) = engine.level_counts();
+    assert!(l0 >= 1, "expected at least one SSTable after flush");
+
+    let got = engine.get(b"sst_vec").unwrap().expect("key should be in SST");
+    let mut expected = Vec::new();
+    for x in &embedding {
+        expected.extend_from_slice(&x.to_le_bytes());
+    }
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn put_indexed_survives_full_flush_compact_reopen_cycle() {
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1;
+    options.l0_compaction_trigger = 2;
+
+    let embeddings: Vec<Vec<f32>> = (1..=5)
+        .map(|i| vec![i as f32 * 0.1, i as f32 * 0.2, i as f32 * 0.3])
+        .collect();
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        for (i, e) in embeddings.iter().enumerate() {
+            let key = format!("vec_{i}");
+            engine.put_indexed(key.as_bytes(), e).unwrap();
+        }
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(options).unwrap();
+    for (i, e) in embeddings.iter().enumerate() {
+        let key = format!("vec_{i}");
+        let got = engine.get(key.as_bytes()).unwrap().unwrap_or_else(|| {
+            panic!("missing key {key} after reopen+compact");
+        });
+        let mut expected = Vec::new();
+        for x in e {
+            expected.extend_from_slice(&x.to_le_bytes());
+        }
+        assert_eq!(got, expected, "vector for {key} corrupted");
+    }
+}
+
+#[test]
+fn nearest_on_empty_engine_returns_empty() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 10).unwrap();
+    assert!(r.is_empty());
+}
+
+#[test]
+fn nearest_returns_self_first() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"target", &[1.0, 0.0, 0.0]).unwrap();
+    engine.put_indexed(b"distractor", &[0.0, 1.0, 0.0]).unwrap();
+
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 2).unwrap();
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].key, b"target");
+    assert_eq!(r[1].key, b"distractor");
+}
+
+#[test]
+fn nearest_orders_by_distance() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"near", &[1.0, 0.01, 0.0]).unwrap();
+    engine.put_indexed(b"mid", &[0.7, 0.7, 0.0]).unwrap();
+    engine.put_indexed(b"far", &[0.0, 1.0, 0.0]).unwrap();
+
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 3).unwrap();
+    assert_eq!(r[0].key, b"near");
+    assert_eq!(r[1].key, b"mid");
+    assert_eq!(r[2].key, b"far");
+    assert!(r[0].distance < r[1].distance);
+    assert!(r[1].distance < r[2].distance);
+}
+
+#[test]
+fn put_indexed_overwrite_updates_search_results() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    // First insert: k is at [1, 0, 0].
+    engine.put_indexed(b"k", &[1.0, 0.0, 0.0]).unwrap();
+    // Distractor far away.
+    engine.put_indexed(b"distractor", &[0.0, 1.0, 0.0]).unwrap();
+
+    let before = engine.nearest(&[1.0, 0.0, 0.0], 1).unwrap();
+    assert_eq!(before[0].key, b"k");
+
+    // Now move k to a different region.
+    engine.put_indexed(b"k", &[0.0, 0.0, 1.0]).unwrap();
+    let after = engine.nearest(&[1.0, 0.0, 0.0], 1).unwrap();
+    // The distractor at [0, 1, 0] is now closer to query [1, 0, 0]
+    // than the relocated k at [0, 0, 1].
+    assert_eq!(after[0].key, b"distractor");
+}
+
+#[test]
+fn delete_removes_key_from_nearest_results() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"keep", &[1.0, 0.0, 0.0]).unwrap();
+    engine.put_indexed(b"delete_me", &[0.99, 0.01, 0.0]).unwrap();
+
+    let before = engine.nearest(&[1.0, 0.0, 0.0], 2).unwrap();
+    assert_eq!(before.len(), 2);
+
+    engine.delete(b"delete_me").unwrap();
+    let after = engine.nearest(&[1.0, 0.0, 0.0], 2).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].key, b"keep");
+}
+
+#[test]
+fn put_indexed_rejects_dimension_mismatch() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"first", &[1.0, 0.0, 0.0]).unwrap();
+    let err = engine.put_indexed(b"second", &[1.0, 0.0]).unwrap_err();
+    assert!(matches!(err, sastran::Error::InvalidArgument(_)));
+    // The engine state should be unchanged: only "first" is indexed.
+    assert_eq!(engine.vector_count(), 1);
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 5).unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].key, b"first");
+}
+
+#[test]
+fn vector_index_recovers_after_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let engine = Engine::open(Options::new(dir.path())).unwrap();
+        engine.put_indexed(b"a", &[1.0, 0.0, 0.0]).unwrap();
+        engine.put_indexed(b"b", &[0.0, 1.0, 0.0]).unwrap();
+        engine.put_indexed(b"c", &[0.0, 0.0, 1.0]).unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    assert_eq!(engine.vector_count(), 3);
+
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 3).unwrap();
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0].key, b"a");
+}
+
+#[test]
+fn vector_index_recovers_through_flush_compact_reopen() {
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1; // force flush per write
+    options.l0_compaction_trigger = 2;
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        // Five vectors in dim 4: four standard basis vectors + a
+        // centroid-ish fifth.
+        for i in 0..4 {
+            let mut v = vec![0.0f32; 4];
+            v[i] = 1.0;
+            engine
+                .put_indexed(format!("vec_{i}").as_bytes(), &v)
+                .unwrap();
+        }
+        // Fifth vector: a different direction.
+        engine
+            .put_indexed(b"vec_4", &[0.5f32, 0.5, 0.5, 0.5])
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 5);
+
+    // Querying each basis direction should find the corresponding
+    // basis vector as the top result.
+    for i in 0..4 {
+        let mut q = vec![0.0f32; 4];
+        q[i] = 1.0;
+        let r = engine.nearest(&q, 1).unwrap();
+        assert!(!r.is_empty());
+        let expected_key = format!("vec_{i}");
+        assert_eq!(r[0].key, expected_key.as_bytes());
+    }
+}
+
+#[test]
+fn vector_index_recovery_respects_tombstones() {
+    let dir = tempdir().unwrap();
+    {
+        let engine = Engine::open(Options::new(dir.path())).unwrap();
+        engine.put_indexed(b"alive", &[1.0, 0.0]).unwrap();
+        engine.put_indexed(b"dead", &[0.0, 1.0]).unwrap();
+        engine.delete(b"dead").unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    // Only "alive" should be in the index after recovery.
+    assert_eq!(engine.vector_count(), 1);
+    let r = engine.nearest(&[0.0, 1.0], 5).unwrap();
+    // Should only find "alive" — "dead" was tombstoned and not
+    // re-indexed.
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].key, b"alive");
+}
+
+#[test]
+fn vector_index_recovery_respects_overwrites() {
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1; // force flushes
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        // First write: vector v1 for key "k".
+        engine.put_indexed(b"k", &[1.0, 0.0]).unwrap();
+        // Overwrite with v2 (likely in a new L0 SSTable).
+        engine.put_indexed(b"k", &[0.0, 1.0]).unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 1);
+
+    // Querying with v2 should find "k"; querying with v1 should
+    // find "k" too (it's the only one), but the recovered vector
+    // should be v2.
+    let r = engine.nearest(&[0.0, 1.0], 1).unwrap();
+    assert_eq!(r[0].key, b"k");
+    // Distance should be ~0 (we're querying with the stored vector).
+    assert!(r[0].distance.abs() < 1e-5);
+}
+
+#[test]
+fn flush_writes_hnsw_snapshot_file() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"k", &[1.0, 0.0, 0.0]).unwrap();
+    engine.flush().unwrap();
+
+    // Should be exactly one hnsw_*.idx file in the directory now.
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("hnsw_")
+                && e.file_name().to_string_lossy().ends_with(".idx")
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly one hnsw_*.idx file");
+}
+
+#[test]
+fn snapshot_file_decodes_back_to_same_index() {
+    use sastran::hnsw::HnswIndex;
+
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"a", &[1.0, 0.0, 0.0]).unwrap();
+    engine.put_indexed(b"b", &[0.0, 1.0, 0.0]).unwrap();
+    engine.put_indexed(b"c", &[0.0, 0.0, 1.0]).unwrap();
+    engine.flush().unwrap();
+
+    // Find the snapshot file.
+    let snapshot_path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .map(|n| {
+                    let s = n.to_string_lossy();
+                    s.starts_with("hnsw_") && s.ends_with(".idx")
+                })
+                .unwrap_or(false)
+        })
+        .expect("snapshot file should exist");
+
+    let bytes = std::fs::read(&snapshot_path).unwrap();
+    let (restored, _keys, _next_id) = HnswIndex::decode_snapshot(&bytes).unwrap();
+    assert_eq!(restored.live_len(), 3);
+}
+
+#[test]
+fn snapshot_carries_correct_next_sstable_id() {
+    use sastran::hnsw::HnswIndex;
+
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1; // force flush per write
+    let engine = Engine::open(options).unwrap();
+
+    // Three put_indexed calls, each triggering a flush -> SSTable.
+    // After the third, next_sst_id should be 3, so the snapshot
+    // filename should be hnsw_000003.idx.
+    engine.put_indexed(b"a", &[1.0, 0.0]).unwrap();
+    engine.put_indexed(b"b", &[0.0, 1.0]).unwrap();
+    engine.put_indexed(b"c", &[1.0, 1.0]).unwrap();
+
+    let snapshots: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|s| s.starts_with("hnsw_") && s.ends_with(".idx"))
+        .collect();
+    assert_eq!(
+        snapshots.len(),
+        1,
+        "expected exactly one snapshot file after old-snapshot cleanup, got {snapshots:?}"
+    );
+    assert_eq!(snapshots[0], "hnsw_000003.idx");
+
+    // The id inside the file should match the filename.
+    let path = dir.path().join(&snapshots[0]);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, _keys, next_id) = HnswIndex::decode_snapshot(&bytes).unwrap();
+    assert_eq!(next_id, 3);
+}
+
+#[test]
+fn old_snapshots_cleaned_up_on_new_flush() {
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1;
+    let engine = Engine::open(options).unwrap();
+
+    // First flush -> hnsw_000001.idx.
+    engine.put_indexed(b"a", &[1.0, 0.0]).unwrap();
+    // Second flush -> hnsw_000002.idx, hnsw_000001.idx deleted.
+    engine.put_indexed(b"b", &[0.0, 1.0]).unwrap();
+
+    let snapshots: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|s| s.starts_with("hnsw_") && s.ends_with(".idx"))
+        .collect();
+    assert_eq!(
+        snapshots.len(),
+        1,
+        "only the latest snapshot should remain, got {snapshots:?}"
+    );
+    assert_eq!(snapshots[0], "hnsw_000002.idx");
+}
+
+#[test]
+fn no_snapshot_written_for_writes_that_dont_flush() {
+    let dir = tempdir().unwrap();
+    // Default 4 MiB memtable; one small write won't trigger a flush.
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put(b"k", b"v").unwrap();
+
+    let snapshots: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|s| s.starts_with("hnsw_") && s.ends_with(".idx"))
+        .collect();
+    assert!(
+        snapshots.is_empty(),
+        "no snapshot should be written when no flush occurred, got {snapshots:?}"
+    );
+}
+
+#[test]
+fn snapshot_written_even_when_only_lsm_writes_happen() {
+    // Even if we only call `put` (no put_indexed), every flush should
+    // still update the HNSW snapshot. The snapshot will just contain
+    // an empty index, but it should exist with the right next_id.
+    use sastran::hnsw::HnswIndex;
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1;
+    let engine = Engine::open(options).unwrap();
+    engine.put(b"k", b"v").unwrap();
+
+    let snapshots: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|s| s.starts_with("hnsw_") && s.ends_with(".idx"))
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+
+    let path = dir.path().join(&snapshots[0]);
+    let bytes = std::fs::read(&path).unwrap();
+    let (restored, _keys, _) = HnswIndex::decode_snapshot(&bytes).unwrap();
+    // No vectors were inserted into the index, but the snapshot must
+    // still serialize correctly.
+    assert_eq!(restored.live_len(), 0);
+}
+
+#[test]
+fn snapshot_recovery_basic() {
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1; // flush per write -> snapshot per write
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        engine.put_indexed(b"a", &[1.0, 0.0, 0.0]).unwrap();
+        engine.put_indexed(b"b", &[0.0, 1.0, 0.0]).unwrap();
+        engine.put_indexed(b"c", &[0.0, 0.0, 1.0]).unwrap();
+        engine.close().unwrap();
+    }
+
+    // Reopen. The latest snapshot should restore all three vectors.
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 3);
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 1).unwrap();
+    assert_eq!(r[0].key, b"a");
+}
+
+#[test]
+fn snapshot_recovery_applies_post_snapshot_writes() {
+    // After the last flush+snapshot, write more vectors that live only
+    // in the WAL/memtable. Recovery must apply them on top of the
+    // snapshot.
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    // Large memtable: the first writes flush, later writes stay in
+    // memtable. Actually we want a controlled split, so flush manually.
+    options.memtable_max_size_bytes = 4 * 1024 * 1024;
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        engine.put_indexed(b"snap_a", &[1.0, 0.0, 0.0]).unwrap();
+        engine.put_indexed(b"snap_b", &[0.0, 1.0, 0.0]).unwrap();
+        engine.flush().unwrap(); // snapshot now reflects a, b
+
+        // These stay in the WAL/memtable (no further flush).
+        engine.put_indexed(b"delta_c", &[0.0, 0.0, 1.0]).unwrap();
+        engine.put_indexed(b"delta_d", &[1.0, 1.0, 0.0]).unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(options).unwrap();
+    // All four should be present: a,b from snapshot; c,d from WAL delta.
+    assert_eq!(engine.vector_count(), 4);
+    for key in [b"snap_a".as_ref(), b"snap_b", b"delta_c", b"delta_d"] {
+        let count = engine
+            .nearest(&[1.0, 0.0, 0.0], 4)
+            .unwrap()
+            .iter()
+            .filter(|r| r.key == key)
+            .count();
+        assert_eq!(count, 1, "missing key {key:?} after recovery");
+    }
+}
+
+#[test]
+fn snapshot_recovery_respects_post_snapshot_delete() {
+    // The classic crash scenario: snapshot has a key, then it's deleted,
+    // then we crash. Recovery must NOT resurrect the deleted key.
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 4 * 1024 * 1024;
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        engine.put_indexed(b"doomed", &[1.0, 0.0, 0.0]).unwrap();
+        engine.put_indexed(b"survivor", &[0.0, 1.0, 0.0]).unwrap();
+        engine.flush().unwrap(); // snapshot reflects both
+
+        engine.delete(b"doomed").unwrap(); // delete lives in WAL delta
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 1, "doomed should not be resurrected");
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 5).unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].key, b"survivor");
+}
+
+#[test]
+fn snapshot_recovery_respects_post_snapshot_overwrite() {
+    // Snapshot has key k pointing at v1. Post-snapshot, k is rewritten
+    // to v2. Recovery must reflect v2.
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 4 * 1024 * 1024;
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        engine.put_indexed(b"k", &[1.0, 0.0, 0.0]).unwrap();
+        engine.put_indexed(b"distractor", &[0.0, 1.0, 0.0]).unwrap();
+        engine.flush().unwrap(); // snapshot: k at [1,0,0]
+
+        engine.put_indexed(b"k", &[0.0, 0.0, 1.0]).unwrap(); // overwrite
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 2);
+
+    // Query at the NEW location of k. k should be the nearest.
+    let r = engine.nearest(&[0.0, 0.0, 1.0], 1).unwrap();
+    assert_eq!(r[0].key, b"k");
+    assert!(r[0].distance.abs() < 1e-5, "should match new vector");
+
+    // Query at the OLD location. k should NOT be there; distractor
+    // (at [0,1,0]) is closer to [1,0,0] than k's new spot [0,0,1]...
+    // actually both are equidistant. Just confirm k is at its new
+    // location, which we did above.
+}
+
+#[test]
+fn snapshot_recovery_falls_back_on_corrupted_snapshot() {
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1;
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        engine.put_indexed(b"a", &[1.0, 0.0, 0.0]).unwrap();
+        engine.put_indexed(b"b", &[0.0, 1.0, 0.0]).unwrap();
+        engine.close().unwrap();
+    }
+
+    // Corrupt the snapshot file by truncating it.
+    let snapshot_path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .map(|n| {
+                    let s = n.to_string_lossy();
+                    s.starts_with("hnsw_") && s.ends_with(".idx")
+                })
+                .unwrap_or(false)
+        })
+        .expect("snapshot exists");
+    // Overwrite with garbage.
+    std::fs::write(&snapshot_path, b"not a valid snapshot").unwrap();
+
+    // Reopen should still succeed via full rebuild from SSTables.
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 2, "full rebuild should recover both");
+    let r = engine.nearest(&[1.0, 0.0, 0.0], 1).unwrap();
+    assert_eq!(r[0].key, b"a");
+}
+
+#[test]
+fn snapshot_recovery_falls_back_when_no_snapshot() {
+    // Write vectors but never flush (so no snapshot), then crash. The
+    // WAL replay + full rebuild path must recover them.
+    let dir = tempdir().unwrap();
+    let options = Options::new(dir.path()); // default 4 MiB; no flush
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        engine.put_indexed(b"a", &[1.0, 0.0, 0.0]).unwrap();
+        engine.put_indexed(b"b", &[0.0, 1.0, 0.0]).unwrap();
+        engine.close().unwrap();
+    }
+
+    // No snapshot file should exist (nothing flushed).
+    let has_snapshot = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            let s = e.file_name().to_string_lossy().to_string();
+            s.starts_with("hnsw_") && s.ends_with(".idx")
+        });
+    assert!(!has_snapshot, "no snapshot should have been written");
+
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 2);
+}
+
+#[test]
+fn snapshot_recovery_through_compaction() {
+    // Force flushes and a compaction, then reopen. The snapshot's
+    // next_sstable_id must correctly identify which SSTables post-date
+    // it, even across a compaction that renumbers things.
+    let dir = tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_max_size_bytes = 1;
+    options.l0_compaction_trigger = 2;
+
+    {
+        let engine = Engine::open(options.clone()).unwrap();
+        for i in 0..6 {
+            // Unique per-i vectors: a distinct fractional offset on
+            // one axis guarantees no two vectors collide (which would
+            // make "nearest" ambiguous).
+            let v = vec![1.0, 0.1 * (i as f32 + 1.0), 0.0, 0.0];
+            engine
+                .put_indexed(format!("v{i}").as_bytes(), &v)
+                .unwrap();
+        }
+        engine.close().unwrap();
+    }
+
+    let engine = Engine::open(options).unwrap();
+    assert_eq!(engine.vector_count(), 6);
+    // Every key should be findable.
+    for i in 0..6 {
+        let key = format!("v{i}");
+        let v = vec![1.0, 0.1 * (i as f32 + 1.0), 0.0, 0.0];
+        let r = engine.nearest(&v, 1).unwrap();
+        assert_eq!(r[0].key, key.as_bytes(), "wrong nearest for {key}");
+    }
+}
+
+#[test]
+fn snapshot_recovery_matches_full_rebuild() {
+    // Build an engine two ways: once normally (snapshot recovery),
+    // once forcing the fallback (delete the snapshot). Both should
+    // recover identical vector sets.
+    let dir1 = tempdir().unwrap();
+    let dir2 = tempdir().unwrap();
+    let mut opt1 = Options::new(dir1.path());
+    let mut opt2 = Options::new(dir2.path());
+    opt1.memtable_max_size_bytes = 1;
+    opt2.memtable_max_size_bytes = 1;
+
+    let vectors: Vec<(String, Vec<f32>)> = (0..20)
+        .map(|i| {
+            // Give each vector a unique direction: a base axis plus a
+            // distinct fractional offset keyed to i, so no two vectors
+            // are identical and "nearest to my own vector" is
+            // unambiguous.
+            let mut v = vec![0.0f32; 8];
+            v[i % 8] = 1.0;
+            v[(i + 1) % 8] += 0.5;
+            v[0] += 0.01 * (i as f32 + 1.0);
+            (format!("key_{i}"), v)
+        })
+        .collect();
+
+    // Engine 1: normal lifecycle.
+    {
+        let e = Engine::open(opt1.clone()).unwrap();
+        for (k, v) in &vectors {
+            e.put_indexed(k.as_bytes(), v).unwrap();
+        }
+        e.close().unwrap();
+    }
+    // Engine 2: same writes.
+    {
+        let e = Engine::open(opt2.clone()).unwrap();
+        for (k, v) in &vectors {
+            e.put_indexed(k.as_bytes(), v).unwrap();
+        }
+        e.close().unwrap();
+    }
+    // Force engine 2 into the fallback by deleting its snapshot.
+    for entry in std::fs::read_dir(dir2.path()).unwrap().filter_map(|e| e.ok()) {
+        let s = entry.file_name().to_string_lossy().to_string();
+        if s.starts_with("hnsw_") && s.ends_with(".idx") {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    let e1 = Engine::open(opt1).unwrap(); // snapshot recovery
+    let e2 = Engine::open(opt2).unwrap(); // full rebuild
+
+    assert_eq!(e1.vector_count(), 20);
+    assert_eq!(e2.vector_count(), 20);
+
+    // Both engines return the same nearest neighbor for each key's vec.
+    for (k, v) in &vectors {
+        let r1 = e1.nearest(v, 1).unwrap();
+        let r2 = e2.nearest(v, 1).unwrap();
+        assert_eq!(r1[0].key, k.as_bytes());
+        assert_eq!(r2[0].key, k.as_bytes());
+    }
+}
+
+#[test]
+fn nearest_filtered_by_key_prefix() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"user_1:a", &[1.0, 0.0, 0.0]).unwrap();
+    engine.put_indexed(b"user_1:b", &[0.9, 0.1, 0.0]).unwrap();
+    engine.put_indexed(b"user_2:c", &[1.0, 0.0, 0.0]).unwrap();
+
+    // Filter to user_1 only. Query is closest to user_2:c, but that's
+    // filtered out, so the top result should be a user_1 key.
+    let r = engine
+        .nearest_filtered(&[1.0, 0.0, 0.0], 5, |k| k.starts_with(b"user_1:"))
+        .unwrap();
+    assert!(!r.is_empty());
+    for result in &r {
+        assert!(
+            result.key.starts_with(b"user_1:"),
+            "leaked non-matching key {:?}",
+            result.key
+        );
+    }
+    assert_eq!(r.len(), 2, "both user_1 keys should be returned");
+}
+
+#[test]
+fn nearest_filtered_pass_all_matches_nearest() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"a", &[1.0, 0.0, 0.0]).unwrap();
+    engine.put_indexed(b"b", &[0.0, 1.0, 0.0]).unwrap();
+    engine.put_indexed(b"c", &[0.0, 0.0, 1.0]).unwrap();
+
+    let unfiltered = engine.nearest(&[1.0, 0.0, 0.0], 3).unwrap();
+    let filtered = engine
+        .nearest_filtered(&[1.0, 0.0, 0.0], 3, |_| true)
+        .unwrap();
+    assert_eq!(unfiltered, filtered);
+}
+
+#[test]
+fn nearest_filtered_pass_none_returns_empty() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"a", &[1.0, 0.0, 0.0]).unwrap();
+    engine.put_indexed(b"b", &[0.0, 1.0, 0.0]).unwrap();
+
+    let r = engine
+        .nearest_filtered(&[1.0, 0.0, 0.0], 5, |_| false)
+        .unwrap();
+    assert!(r.is_empty());
+}
+
+#[test]
+fn nearest_filtered_selective_still_finds_k() {
+    // Many vectors; a filter that passes only a handful. The adaptive
+    // over-query must still find them.
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+
+    // 100 vectors. Only those with keys ending in "_keep" pass.
+    for i in 0..100 {
+        let mut v = vec![0.0f32; 8];
+        v[i % 8] = 1.0;
+        v[0] += 0.001 * (i as f32 + 1.0); // unique direction
+        let key = if i % 25 == 0 {
+            format!("vec_{i}_keep")
+        } else {
+            format!("vec_{i}_drop")
+        };
+        engine.put_indexed(key.as_bytes(), &v).unwrap();
+    }
+
+    // 4 keys pass (i = 0, 25, 50, 75). Ask for 4.
+    let r = engine
+        .nearest_filtered(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 4, |k| {
+            k.ends_with(b"_keep")
+        })
+        .unwrap();
+    assert_eq!(r.len(), 4, "should find all 4 matching vectors");
+    for result in &r {
+        assert!(result.key.ends_with(b"_keep"));
+    }
+}
+
+#[test]
+fn nearest_filtered_respects_distance_order() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    // All pass the filter; verify ordering is preserved.
+    engine.put_indexed(b"near", &[1.0, 0.01, 0.0]).unwrap();
+    engine.put_indexed(b"mid", &[0.7, 0.7, 0.0]).unwrap();
+    engine.put_indexed(b"far", &[0.0, 1.0, 0.0]).unwrap();
+
+    let r = engine
+        .nearest_filtered(&[1.0, 0.0, 0.0], 3, |_| true)
+        .unwrap();
+    assert_eq!(r[0].key, b"near");
+    assert_eq!(r[1].key, b"mid");
+    assert_eq!(r[2].key, b"far");
+}
+
+#[test]
+fn nearest_filtered_k_zero_returns_empty() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    engine.put_indexed(b"a", &[1.0, 0.0]).unwrap();
+    let r = engine.nearest_filtered(&[1.0, 0.0], 0, |_| true).unwrap();
+    assert!(r.is_empty());
+}
+
+#[test]
+fn nearest_filtered_on_empty_engine() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let r = engine
+        .nearest_filtered(&[1.0, 0.0, 0.0], 5, |_| true)
+        .unwrap();
+    assert!(r.is_empty());
+}

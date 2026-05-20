@@ -1,47 +1,52 @@
 # sastran
 
-A unified key-value and vector storage substrate, written from scratch in
-Rust. Built for AI agent memory: the workload where every "thing the agent
+A unified key-value and vector storage engine, written from scratch in Rust.
+Built for AI agent memory: the workload where every "thing the agent
 remembers" needs both an exact lookup (`get("user_123_profile")`) and a
-similarity search (`nearest(some_embedding, k=10)`) against the same data.
+similarity search (`nearest(some_embedding, 10)`) against the same data.
 
 Today that workload typically requires two systems — a KV store *and* a
 vector database — kept in sync by hand. `sastran` collapses them into one
-crash-safe storage engine.
+crash-safe engine: a log-structured merge tree for keys and values, with an
+HNSW vector index layered on top, sharing the same durability and recovery
+machinery.
 
-> **Status:** v0.1.0 ships the LSM substrate: durable, crash-safe key-value
-> storage with the full classical pipeline (WAL → memtable → SSTables →
-> compaction → bloom filters). The HNSW-based vector index layer is the
-> next milestone (v0.2.0).
+> **Status:** v0.2.0. The LSM substrate (WAL -> memtable -> SSTables ->
+> compaction -> bloom filters) and the HNSW vector index (insert, search,
+> delete with edge repair, configurable metrics, filtered search,
+> crash-safe snapshots) are both implemented and tested. ~190 tests,
+> zero `unsafe`.
 
 ---
 
 ## What's interesting
 
-A few things that distinguish this from the dozens of toy LSMs on GitHub:
+What distinguishes this from the many toy LSMs and standalone HNSW crates on
+GitHub:
 
-- **Durability discipline.** Every write follows the order *WAL append →
-  fsync → memtable update*, in that exact order. Reads may only observe
-  values that are already durable. The README's "Architecture" section
-  walks through why this ordering is the only correct one and what breaks
-  if you change it.
-- **Property-tested correctness.** The memtable is verified against a
-  `BTreeMap` reference model under randomized operation sequences
-  (`proptest`). The WAL record format has a property test that flips
-  random bits and asserts every corruption is either detected or
-  produces observably different output.
-- **Crash-safe compaction recovery.** Compaction writes its output to a
-  `.tmp` file, atomically renames, and only then deletes the inputs. If
-  the process dies between rename and delete, `discover_sstables` on
-  next open reconciles the orphans by precise rules (kept the highest L1
-  id; drop L0 files with id ≤ surviving L1 id). The invariants are tight
-  enough to prove without simulation.
-- **Bloom filters give a ~28× speedup on absent-key lookups.** Measured,
-  not guessed. See [BENCHMARKS.md](./BENCHMARKS.md).
-- **Send + Sync engine, enforced by a compile-time test.** The engine can
-  be shared across threads via `Arc<Engine>`. Concurrent reads on SSTables
-  use `pread(2)`-style positioned reads with no shared mutable state.
-- **Zero unsafe code.** No `unsafe` blocks anywhere in the crate.
+- **It's actually unified.** `put`, `put_indexed`, `get`, `delete`, and
+  `nearest` all run through one engine, share one durability ordering, and
+  recover together. A vector insert is durable in the WAL before it's
+  acknowledged, exactly like a key-value write.
+- **Crash-safe vector recovery.** The HNSW graph is snapshotted to disk on
+  flush (atomic-rename, CRC-checked). On open, the engine loads the latest
+  snapshot and replays only the post-snapshot delta - O(memtable + recent
+  SSTables) instead of rebuilding the whole graph. A corrupted or missing
+  snapshot falls back to a full rebuild from the LSM, which is always the
+  source of truth.
+- **Real HNSW deletes.** Not soft tombstones - deleted nodes' neighbors are
+  re-linked (edge repair) so graph connectivity and recall hold. Recall@10
+  stays above 0.80 after deleting 30% of a 2,000-vector index.
+- **Bloom filters give a ~28x speedup on absent-key lookups** (94 ns vs
+  2.63 us). Measured, not guessed.
+- **Property-tested correctness.** The memtable is checked against a
+  `BTreeMap` reference model under randomized operations; the WAL record
+  format is fuzzed for corruption detection.
+- **Honest measurement.** Quantization retains 96.2% of recall at 4x
+  compression on realistic data; filtered queries cost ~5x unfiltered for a
+  structural reason that's documented, not hidden. See
+  [BENCHMARKS.md](./BENCHMARKS.md).
+- **Zero unsafe code.**
 
 ## Quick start
 
@@ -50,149 +55,135 @@ use sastran::{Engine, Options};
 
 let engine = Engine::open(Options::new("/path/to/db"))?;
 
-engine.put(b"hello", b"world")?;
-assert_eq!(engine.get(b"hello")?, Some(b"world".to_vec()));
+// Key-value.
+engine.put(b"user_42:profile", b"{...}")?;
+assert_eq!(engine.get(b"user_42:profile")?, Some(b"{...}".to_vec()));
 
-engine.delete(b"hello")?;
-assert_eq!(engine.get(b"hello")?, None);
+// Vector: store an embedding under a key.
+engine.put_indexed(b"user_42:memory_99", &[0.1, 0.2, 0.3, /* ... */])?;
+
+// Similarity search: k nearest embeddings to a query.
+let hits = engine.nearest(&query_embedding, 10)?;
+for hit in &hits {
+    println!("{:?} at distance {}", hit.key, hit.distance);
+}
+
+// Filtered search: nearest, restricted to keys matching a predicate.
+let user_hits = engine.nearest_filtered(
+    &query_embedding,
+    10,
+    |key| key.starts_with(b"user_42:"),
+)?;
 
 engine.close()?;
 # Ok::<(), sastran::Error>(())
 ```
 
-The engine handles flushes and compactions automatically; the public API
-is just `open` / `put` / `get` / `delete` / `flush` / `close`.
+`put_indexed` writes the embedding to the LSM at full precision *and* inserts
+it into the HNSW index. `get` returns the stored bytes; `nearest` returns
+keys ranked by similarity. A `delete` removes a key from both the LSM and the
+index.
 
 ## Architecture
 
 ```
-                    Engine (Mutex<EngineInner>)
-                    │
-       writes ──────┤
-        │           │
-        ▼           ▼
-   ┌─────────┐  ┌───────────┐
-   │  WAL    │  │  Memtable │       in memory
-   │ (fsync) │  │ (BTreeMap)│
-   └─────────┘  └─────┬─────┘
-                      │ flush at size threshold
-                      ▼
-                ┌──────────┐
-                │ L0 SST 0 │   ←── newest L0 (may overlap)
-                │ L0 SST 1 │
-                │ L0 SST … │
-                └─────┬────┘
-                      │ compact when L0 ≥ trigger
-                      ▼
-                ┌──────────┐
-                │  L1 SST  │   ←── non-overlapping, deduped, tombstones
-                └──────────┘       garbage-collected
+                 Engine
+                 |-- Mutex<EngineInner>          (LSM: serial mutations)
+                 +-- Arc<RwLock<VectorIndex>>     (HNSW: concurrent reads)
 
-  reads ──► memtable → L0 (newest first) → L1
-                       │
-                       ▼
-              bloom filter per SSTable
-              short-circuits absent keys
+   put / put_indexed / delete
+        |
+        v
+   +---------+   +-----------+        +--------------+
+   |  WAL    |   |  Memtable |        | HNSW index   |
+   | (fsync) |   | (BTreeMap)|        | (graph +     |
+   +---------+   +-----+-----+        |  key<->node) |
+                       | flush         +------+-------+
+                       v                      | snapshot on flush
+                 +----------+                 v
+                 | L0 SSTs  |           hnsw_<id>.idx
+                 |   v compact            (atomic rename, CRC)
+                 | L1 SST   |
+                 +----+-----+
+   get ----> memtable -> L0 -> L1   (bloom filter per SSTable)
+   nearest --> HNSW graph traversal (read lock; concurrent-safe)
 ```
 
-The write path is fsync-ordered for durability. The read path falls through
-levels newest-first and stops on the first found-or-deleted answer (so
-tombstones in newer SSTables correctly mask older puts).
-
-### Why fsync ordering matters
-
-Every write does three things: (A) append to WAL, (B) fsync, (C) update
-the memtable. The only correct order is **A → B → C**. Any other ordering
-silently leaks pre-durable values to readers, which is the kind of bug
-that surfaces only on power loss and corrupts user data. The `Engine::put`
-implementation is annotated with this invariant.
+Writes are fsync-ordered for durability (WAL append -> fsync -> memtable).
+The vector index is locked separately from the LSM so concurrent `nearest`
+queries don't block writes; the two locks are always acquired LSM-first to
+avoid deadlock.
 
 ## Performance
 
-Measured on WSL2 / ext4, single-threaded, 16-byte keys, 100-byte values:
+Measured on WSL2 / ext4, single-threaded, release build. Full methodology
+and interpretation in [BENCHMARKS.md](./BENCHMARKS.md).
 
-| Workload | Latency / op | Throughput |
+**Key-value (16 B keys, 100 B values):**
+
+| Operation | Latency | Throughput |
 |---|---:|---:|
-| `put` (fsync per write) | 436 µs | 2.3 K/sec |
-| `get` (key present) | 1.06 µs | 946 K/sec |
-| `get` (absent, bloom **on**) | **94 ns** | 10.7 M/sec |
-| `get` (absent, bloom **off**) | 2.63 µs | 381 K/sec |
-| YCSB-A (50% read / 50% write) | 217 µs | 4.6 K/sec |
-| YCSB-B (95% read / 5% write) | 27 µs | 36.5 K/sec |
+| `put` (fsync per write) | 436 us | 2.3 K/sec |
+| `get` (present) | 1.06 us | 946 K/sec |
+| `get` (absent, bloom on) | **94 ns** | 10.7 M/sec |
+| `get` (absent, bloom off) | 2.63 us | 381 K/sec |
 
-The 28× speedup on absent-key reads is the clearest demonstration that the
-bloom filter implementation is doing what its design claims. Write
-throughput is currently fsync-bound (synchronous-durability mode);
-[BENCHMARKS.md](./BENCHMARKS.md) explains the trade-off and how group
-commit would unlock the rest.
+**Vector (128-dim embeddings, 5 K-vector index):**
 
-Reproduce with `cargo bench`. HTML reports land in `target/criterion/`.
+| Operation | Latency | Throughput |
+|---|---:|---:|
+| `put_indexed` | 617 us | 1.6 K/sec |
+| `nearest` (k=10) | 111 us | 9.0 K/sec |
+| `nearest_filtered` (k=10, ~10% selective) | 563 us | 1.8 K/sec |
+
+**Quantization (8-bit scalar, clustered data):** 96.2% of full-precision
+recall@10 at 4x compression.
+
+Reproduce with `cargo bench` and
+`cargo run --example quantization_recall --release`.
 
 ## What's next
 
-- **HNSW vector index layer (v0.2.0).** Values flagged as embeddings get
-  inserted into a per-engine persistent HNSW graph alongside the LSM. A
-  new `nearest(query, k)` API serves approximate-nearest-neighbor queries.
-  Crash safety extends to the vector index through the same atomic-rename
-  + recovery patterns used for SSTables.
-- **Group commit.** Batch concurrent writes into one fsync. Expected ~10×
-  write throughput improvement at the cost of a small state machine in
-  the WAL writer.
-- **Multi-level compaction.** Currently L0 → L1; extending to L1 → L2 →
-  … is mechanical but requires a manifest file to track per-SSTable key
-  ranges. Today's level structure is encoded in filenames.
-- **Background compaction.** Compaction runs synchronously inside the
-  triggering write; a background thread with a small in-flight queue
-  would smooth write-latency spikes.
-- **Cross-engine benchmark comparison.** `sastran` is currently benchmarked
-  only against itself. Comparing against RocksDB and `sled` requires
-  careful methodology (matched durability settings, matched workload
-  generator) and is intentionally deferred to a future release.
+- **Native u8 quantized storage in the HNSW.** The quantizer is implemented
+  and measured, but the live index still stores f32. Wiring native u8
+  storage in would realize the 4x memory reduction in production.
+- **Predicate-aware filtered traversal.** Filtering is currently post-hoc
+  (search, then discard non-matches). Pushing the predicate into the graph
+  walk would make highly selective filters fast.
+- **Group commit** for write throughput (batch fsyncs).
+- **Background compaction** to smooth write-latency spikes.
+- **Multi-level compaction** beyond the current two levels (needs a
+  manifest).
+- **Cross-engine benchmarks** against RocksDB / Qdrant with matched
+  durability settings.
 
 ## Limitations
 
-- Two LSM levels only. The mechanism is sound but only two levels are
-  implemented; this is a portfolio-scale simplification.
-- Synchronous compaction. Compactions block the triggering write. A
-  background thread would mitigate.
-- No range scans yet. Point lookups only. The `MergingIterator` primitive
-  is in place; the public range-scan API is a small addition.
-- No manifest file. Live SSTables are tracked via filenames. A manifest
-  would be needed to track per-SSTable key ranges for finer-grained
-  compaction.
-- WAL corruption note: a corrupted `key_len` field in a WAL record that
-  decodes to a value below `MAX_KEY_LEN` but above the remaining file
-  size is indistinguishable from a torn-tail truncation. This is a
-  fundamental property of length-prefixed formats with leading CRCs and
-  is documented inline. LevelDB-style fixed-size blocks would close this
-  gap.
+- Two LSM levels only; the mechanism generalizes but isn't extended yet.
+- Synchronous compaction and synchronous snapshot writes block the
+  triggering operation.
+- No range scans (point lookups only; the merge primitive exists).
+- HNSW quantization is measured but not wired into the live index.
+- Filtered search is post-hoc; very selective filters degrade toward a scan.
+- No manifest file; live SSTables are tracked via filenames.
 
 ## Module layout
 
 ```
 src/
-├── lib.rs               public API surface
-├── engine.rs            top-level Engine, lifecycle, flush, compaction
-├── error.rs             crate-wide Error enum
-├── memtable.rs          in-memory sorted write buffer with tombstones
-├── io/
-│   ├── mod.rs           Io trait — abstraction for filesystem access
-│   └── fs.rs            production filesystem backend (StdFs)
-├── wal/
-│   ├── mod.rs           write-ahead log
-│   ├── record.rs        on-disk record format (CRC + length-prefixed)
-│   ├── writer.rs        append + fsync
-│   └── reader.rs        replay with torn-tail tolerance
-└── sstable/
-    ├── mod.rs           SSTable file format constants
-    ├── writer.rs        block-based writer with optional bloom filter
-    ├── reader.rs        point lookups + forward iteration
-    ├── merge.rs         k-way merge with newest-wins deduplication
-    └── bloom.rs         double-hashing bloom filter (xxh3_128 + KM trick)
+|-- engine.rs      top-level Engine: lifecycle, put/get/delete,
+|                  put_indexed/nearest/nearest_filtered, recovery
+|-- memtable.rs    sorted write buffer (Put / Vector / Tombstone)
+|-- wal/           write-ahead log (Put / Vector / Delete records)
+|-- sstable/       block SSTables: writer, reader, merge, bloom
+|-- hnsw/          vector index: graph (index.rs) + snapshot format
+|-- quantize.rs    8-bit scalar quantizer (standalone, measured)
+|-- io/            Io trait + StdFs backend (for fault injection)
++-- error.rs       crate-wide error type
 ```
 
-Roughly 1,800 LOC of source plus 1,500 LOC of tests (97 tests total,
-including property tests).
+~3,000 lines of source, ~2,500 of tests (~190 tests including property
+tests and recall benchmarks).
 
 ## Testing
 
@@ -200,21 +191,16 @@ including property tests).
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo bench
+cargo run --example quantization_recall --release
 ```
-
-CI runs all three on every push (when added).
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option. Standard for the
-Rust ecosystem.
+Dual-licensed under MIT or Apache-2.0, at your option.
 
 ## Acknowledgements
 
-The architecture draws on the canonical LSM literature: the original
-LevelDB design notes, the RocksDB documentation, and the
-"Mini-LSM in Rust" walkthrough by Skyzh. The bloom filter uses the
-Kirsch-Mitzenmacher double-hashing trick (Random Structures &
-Algorithms, 2008). The deterministic-testing-via-Io-trait approach is
-inspired by FoundationDB and TigerBeetle, though `sastran`'s implementation
-is much simpler.
+LSM design from the LevelDB and RocksDB literature. HNSW from Malkov &
+Yashunin (2018); the bloom filter uses the Kirsch-Mitzenmacher double-hashing
+trick. The Io-trait-for-deterministic-testing approach is inspired by
+FoundationDB and TigerBeetle.

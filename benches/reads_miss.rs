@@ -26,7 +26,7 @@ const N_ABSENT: usize = 100_000;
 /// against 100K populated keys is astronomically low; we treat
 /// collisions as a no-op for measurement purposes.
 fn absent_keys() -> Vec<Vec<u8>> {
-    let mut rng = StdRng::seed_from_u64(0xAB5E47DEAD_BEEF_u64);
+    let mut rng = StdRng::seed_from_u64(0x00AB_5E47_DEAD_BEEF_u64);
     (0..N_ABSENT)
         .map(|_| {
             let mut k = vec![0u8; KEY_SIZE];

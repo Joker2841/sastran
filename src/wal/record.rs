@@ -43,13 +43,18 @@ pub const MAX_VALUE_LEN: u32 = 64 * 1024 * 1024;
 
 const KIND_PUT: u8 = 0x01;
 const KIND_DELETE: u8 = 0x02;
+const KIND_VECTOR: u8 = 0x03;
 
 /// The mutation a record represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordKind {
     /// A `(key, value)` insertion or update.
     Put,
-    /// A deletion of `key`. The on-disk value bytes are empty for deletes.
+    /// A `(key, vector_bytes)` vector insertion. Same payload shape
+    /// as `Put` on the wire; distinguished by kind byte so consumers
+    /// can route to the HNSW index.
+    Vector,
+    /// A deletion of `key`. Wire value bytes are empty for deletes.
     Delete,
 }
 
@@ -57,6 +62,7 @@ impl RecordKind {
     fn to_byte(self) -> u8 {
         match self {
             RecordKind::Put => KIND_PUT,
+            RecordKind::Vector => KIND_VECTOR,
             RecordKind::Delete => KIND_DELETE,
         }
     }
@@ -64,6 +70,7 @@ impl RecordKind {
     fn from_byte(b: u8) -> Option<Self> {
         match b {
             KIND_PUT => Some(RecordKind::Put),
+            KIND_VECTOR => Some(RecordKind::Vector),
             KIND_DELETE => Some(RecordKind::Delete),
             _ => None,
         }
@@ -442,5 +449,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vector_round_trip_basic() {
+        round_trip(RecordKind::Vector, b"key", b"\x01\x02\x03\x04\x05\x06\x07\x08");
+    }
+
+    #[test]
+    fn vector_round_trip_large() {
+        let value = vec![0xCDu8; 4096];
+        round_trip(RecordKind::Vector, b"big_vec", &value);
     }
 }

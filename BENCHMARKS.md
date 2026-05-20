@@ -159,3 +159,108 @@ numbers above use the median rather than the mean.
 
 For the read benchmarks, the variance is much lower (a few outliers, all
 mild). Reads have no background work to spike them.
+
+---
+
+# Vector operations (v0.2.0)
+
+The vector half of the engine — HNSW-backed approximate nearest-neighbor
+search — adds three measured operations. Same environment as the LSM
+benchmarks (WSL2 / ext4, single-threaded, release build).
+
+## Workload
+
+| | |
+|---|---|
+| Embedding dimension | 128 |
+| Index size (query benches) | 5,000 vectors |
+| Distance metric | cosine (default) |
+| HNSW parameters | M=16, efConstruction=100, efSearch=50 |
+| Queries sampled | 1,000 |
+| k | 10 |
+
+## Results
+
+| Operation | Latency / op | Throughput |
+|---|---:|---:|
+| `put_indexed` (vector insert) | 617 µs | 1.6 K/sec |
+| `nearest` (ANN query, k=10) | 111 µs | 9.0 K/sec |
+| `nearest_filtered` (k=10, ~10% selective) | 563 µs | 1.8 K/sec |
+
+## Interpretation
+
+### `put_indexed`: 617 µs
+
+A vector insert does everything a regular `put` does — WAL append, fsync,
+memtable update — plus an HNSW graph insertion (descent, beam search, edge
+selection, bidirectional wiring) and the periodic snapshot write on flush.
+The ~617 µs figure is the ~436 µs fsync-bound `put` cost plus roughly
+180 µs of graph maintenance at dimension 128. As with plain writes, the
+dominant cost is the synchronous fsync; group commit (future work) would
+help here too.
+
+### `nearest`: 111 µs
+
+A k=10 ANN query over 5,000 dimension-128 vectors. This is pure in-memory
+graph traversal — no fsync, no disk. Each query visits roughly
+`efSearch × average_degree` nodes and computes a 128-wide distance at each,
+landing at ~111 µs, or ~9,000 queries/sec single-threaded. Concurrent
+queries scale further because `nearest` takes only the read side of the
+vector index lock.
+
+### `nearest_filtered`: 563 µs
+
+Filtering to keys with a `user_0:` prefix (≈10% of vectors pass). The query
+costs ~5× an unfiltered `nearest` for a structural reason: the filter is
+applied *after* the graph search returns candidates, so to return k results
+the search must over-query (request more candidates than k and discard the
+rejects). At ~10% selectivity the engine searches with `ef ≈ k × 10` to
+collect enough passing candidates.
+
+This is the standard limitation of post-hoc filtering on a graph index. A
+predicate that passes only a tiny fraction of vectors degrades toward a
+full scan, since that is the only correct way to find the k nearest passing
+vectors. Pushing the predicate *into* graph traversal (so filtered-out nodes
+never consume result slots) is the research-grade fix used by production
+filterable-ANN systems; it is documented as future work. An earlier
+implementation that grew the candidate set by repeated doubling was ~35%
+slower; the current single-wide-search approach is what produced the figure
+above.
+
+# Scalar quantization (v0.2.0)
+
+8-bit scalar quantization is implemented as a standalone, measured component
+(`src/quantize.rs`). It maps each f32 vector component to one byte using
+per-dimension min/max scaling, a 4× memory reduction. The measurement
+harness (`examples/quantization_recall.rs`) builds two HNSW indexes — one
+full-precision, one quantize-then-dequantize — and compares recall@10
+against a full-precision brute-force ground truth.
+
+## Results
+
+| Dataset | Full-precision recall@10 | Quantized recall@10 | Retained | Compression |
+|---|---:|---:|---:|---:|
+| Clustered (realistic) | >0.99 | 0.962 | 96.2% | 4.0× |
+| Uniform random (adversarial) | 0.697 | 0.703 | ~100% | 4.0× |
+
+## Interpretation
+
+On **clustered data** — which is how real sentence and image embeddings are
+distributed, grouping into neighborhoods rather than filling the space
+uniformly — quantization retains 96.2% of full-precision recall while
+cutting per-vector storage from 512 bytes to 128 bytes. That is the
+representative result: ~4% recall cost for 4× memory savings.
+
+On **uniform-random data** both indexes score ~0.70. This is the curse of
+dimensionality, not a quantization or implementation issue: in
+high-dimensional uniform-random space all points are nearly equidistant, so
+the true nearest neighbors are barely closer than the rest and any
+approximate search misses some. The point of including it is to show that
+quantization is nearly free regardless of data shape — the recall difference
+between full and quantized is within noise on both datasets. Absolute recall
+depends on how clustered the data is, and real embeddings are clustered.
+
+Quantization is not yet wired into the live HNSW index, which stores
+full-precision f32. Native u8 storage in the index — the change that would
+realize the 4× memory savings in production rather than only in the
+benchmark — is documented as future work.

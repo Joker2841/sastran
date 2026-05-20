@@ -31,9 +31,15 @@ use std::collections::BTreeMap;
 /// value (`Put`) or a deletion marker (`Tombstone`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
-    /// Key holds this value.
+    /// Key holds a regular (opaque) value.
     Put(Vec<u8>),
-    /// Key has been deleted; this masks older versions on disk.
+    /// Key holds an embedding vector. Bytes are `dim * 4` long,
+    /// containing `dim` f32 values in little-endian order. Once the
+    /// HNSW index is wired in (next commit), insertion of a `Vector`
+    /// entry will trigger an index update too.
+    Vector(Vec<u8>),
+    /// Key has been deleted; this masks older versions on disk and in
+    /// the vector index.
     Tombstone,
 }
 
@@ -43,8 +49,15 @@ impl Entry {
     fn payload_size(&self) -> usize {
         match self {
             Entry::Put(v) => v.len(),
+            Entry::Vector(v) => v.len(),
             Entry::Tombstone => 0,
         }
+    }
+
+    /// True if this entry carries a vector embedding (for index
+    /// integration in a later commit).
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Entry::Vector(_))
     }
 }
 
@@ -98,6 +111,27 @@ impl Memtable {
         }
     }
 
+    /// Insert or overwrite `key` with a vector value. Same size
+    /// accounting as `put`; differs only in the entry variant stored,
+    /// which downstream consumers (WAL/SSTable/HNSW) use to identify
+    /// vector entries.
+    pub fn put_vector(&mut self, key: Vec<u8>, vector_bytes: Vec<u8>) {
+        let new_payload = vector_bytes.len();
+        let new_entry = Entry::Vector(vector_bytes);
+        match self.map.insert(key.clone(), new_entry) {
+            None => {
+                self.approximate_size += key.len() + new_payload;
+            }
+            Some(old) => {
+                let old_size = old.payload_size();
+                self.approximate_size = self
+                    .approximate_size
+                    .saturating_sub(old_size)
+                    .saturating_add(new_payload);
+            }
+        }
+    }
+
     /// Record a tombstone for `key`. Idempotent: tombstoning an
     /// already-tombstoned key is a no-op on size.
     pub fn delete(&mut self, key: Vec<u8>) {
@@ -119,6 +153,7 @@ impl Memtable {
     pub fn get(&self, key: &[u8]) -> Lookup<'_> {
         match self.map.get(key) {
             Some(Entry::Put(v)) => Lookup::Found(v.as_slice()),
+            Some(Entry::Vector(v)) => Lookup::Found(v.as_slice()),
             Some(Entry::Tombstone) => Lookup::Deleted,
             None => Lookup::Missing,
         }
@@ -309,5 +344,50 @@ mod tests {
             key.clone().prop_map(Op::Delete),
             key.prop_map(Op::Get),
         ]
+    }
+
+    #[test]
+    fn put_vector_then_get_returns_bytes() {
+        let mut m = Memtable::new();
+        let v_bytes = vec![1u8, 2, 3, 4, 5, 6, 7, 8]; // 2 f32 values worth
+        m.put_vector(b"vec_key".to_vec(), v_bytes.clone());
+        assert_eq!(m.get(b"vec_key"), Lookup::Found(v_bytes.as_slice()));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.approximate_size(), b"vec_key".len() + v_bytes.len());
+    }
+
+    #[test]
+    fn put_vector_then_delete_yields_deleted() {
+        let mut m = Memtable::new();
+        m.put_vector(b"k".to_vec(), vec![0xAB; 12]);
+        m.delete(b"k".to_vec());
+        assert_eq!(m.get(b"k"), Lookup::Deleted);
+    }
+
+    #[test]
+    fn put_vector_then_put_overwrites() {
+        // Writing a regular Put on top of a Vector replaces it.
+        let mut m = Memtable::new();
+        m.put_vector(b"k".to_vec(), vec![0xAB; 12]);
+        m.put(b"k".to_vec(), b"now i am bytes".to_vec());
+        assert_eq!(m.get(b"k"), Lookup::Found(b"now i am bytes"));
+    }
+
+    #[test]
+    fn iter_yields_vector_entries() {
+        let mut m = Memtable::new();
+        m.put_vector(b"a".to_vec(), vec![1, 2, 3, 4]);
+        m.put(b"b".to_vec(), b"plain".to_vec());
+        let entries: Vec<(&[u8], &Entry)> = m.iter().collect();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].1, Entry::Vector(_)));
+        assert!(matches!(entries[1].1, Entry::Put(_)));
+    }
+
+    #[test]
+    fn is_vector_correctly_identifies_variants() {
+        assert!(Entry::Vector(vec![0; 8]).is_vector());
+        assert!(!Entry::Put(vec![0; 8]).is_vector());
+        assert!(!Entry::Tombstone.is_vector());
     }
 }

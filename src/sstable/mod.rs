@@ -59,3 +59,6 @@ pub(crate) const KIND_PUT: u8 = 0x01;
 
 /// Marker byte inside an SSTable entry indicating a tombstone.
 pub(crate) const KIND_DELETE: u8 = 0x02;
+
+/// Marker byte inside an SSTable entry indicating a vector value.
+pub(crate) const KIND_VECTOR: u8 = 0x03;

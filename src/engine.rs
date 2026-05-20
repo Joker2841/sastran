@@ -40,8 +40,10 @@ use crate::memtable::{Entry, Lookup, Memtable};
 use crate::sstable::{MergeSource, MergingIterator, SsTableLookup, SsTableReader, SsTableWriter};
 use crate::wal::{RecordKind, WalReader, WalWriter};
 use crate::{Error, Result};
+use crate::hnsw::{HnswIndex, HnswParams, NodeId};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Filename of the active write-ahead log inside the engine's directory.
@@ -54,44 +56,16 @@ const SST_EXT: &str = "sst";
 /// Engine configuration.
 #[derive(Clone)]
 pub struct Options {
-    /// Directory that holds the engine's files. Created if absent.
     pub path: PathBuf,
-
-    /// Filesystem backend. Production code passes `Arc::new(StdFs::new())`;
-    /// tests can substitute a fault-injecting backend.
     pub io: Arc<dyn Io>,
-
-    /// Maximum approximate size, in bytes, the memtable may reach
-    /// before an automatic flush is triggered.
-    ///
-    /// "Approximate" because the size is tracked as the sum of key and
-    /// value bytes only — it does not account for the underlying
-    /// `BTreeMap`'s per-node overhead. As a result, the actual memory
-    /// footprint may be 2-3x larger than this value.
-    ///
-    /// Default: 4 MiB. Smaller values cause more frequent flushes and
-    /// more SSTables; larger values cause longer flush stalls.
     pub memtable_max_size_bytes: usize,
-
-    /// Number of L0 SSTables that triggers an L0+L1 → L1 compaction.
-    ///
-    /// When `levels.l0.len() >= l0_compaction_trigger` after a flush,
-    /// the engine merges all of L0 and L1 into a single new L1 SSTable.
-    ///
-    /// Default: 4 (LevelDB's value). Smaller values run compaction more
-    /// often (lower read amplification, higher write amplification);
-    /// larger values do the opposite.
     pub l0_compaction_trigger: usize,
-
-    /// Bits per key for bloom filters embedded in each SSTable.
-    ///
-    /// Set to 0 to disable bloom filters entirely (SSTables will be
-    /// written without a filter block; reads on absent keys will do
-    /// one data-block read per SSTable per lookup).
-    ///
-    /// Default: 10 (≈ 1% false-positive rate, 7 hash functions).
     pub bloom_bits_per_key: u32,
+    /// Parameters for the HNSW vector index. See [`HnswParams`] for
+    /// individual knobs.
+    pub hnsw_params: HnswParams,
 }
+
 
 impl Options {
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -101,6 +75,7 @@ impl Options {
             memtable_max_size_bytes: 4 * 1024 * 1024,
             l0_compaction_trigger: 4,
             bloom_bits_per_key: 10,
+            hnsw_params: HnswParams::default(),
         }
     }
 }
@@ -132,6 +107,69 @@ impl LevelState {
     }
 }
 
+/// Result of a [`Engine::nearest`] query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NearestResult {
+    /// The matching key.
+    pub key: Vec<u8>,
+    /// Distance from query under the configured metric. Smaller is
+    /// closer; for cosine the range is `[0, 2]`; for Euclidean it
+    /// is squared distance; for inner product it is negated.
+    pub distance: f32,
+}
+
+/// State of the vector index, held behind an RwLock so concurrent
+/// searches don't serialize.
+struct VectorIndex {
+    hnsw: HnswIndex,
+    /// Maps engine-key → graph node id.
+    key_to_node: HashMap<Vec<u8>, NodeId>,
+    /// Reverse of `key_to_node`: graph node id → engine-key. Kept in
+    /// lockstep with `key_to_node` via `register`/`unregister` so the
+    /// two never drift. Lets `nearest` map results back to keys in
+    /// O(1) instead of scanning.
+    node_to_key: HashMap<NodeId, Vec<u8>>,
+    /// Vector dimension established on first insert; later inserts
+    /// must match. `None` until the first insert.
+    expected_dim: Option<usize>,
+}
+
+impl VectorIndex {
+    fn new(params: HnswParams) -> Self {
+        Self {
+            hnsw: HnswIndex::new(params),
+            key_to_node: HashMap::new(),
+            node_to_key: HashMap::new(),
+            expected_dim: None,
+        }
+    }
+
+    fn live_count(&self) -> usize {
+        self.hnsw.live_len()
+    }
+
+    /// Register a key↔node mapping in both directions. Overwrites any
+    /// previous mapping for `key` (caller is responsible for deleting
+    /// the old graph node first).
+    fn register(&mut self, key: Vec<u8>, node_id: NodeId) {
+        self.key_to_node.insert(key.clone(), node_id);
+        self.node_to_key.insert(node_id, key);
+    }
+
+    /// Remove `key`'s mapping from both maps, returning its node id if
+    /// it was present.
+    fn unregister(&mut self, key: &[u8]) -> Option<NodeId> {
+        let node_id = self.key_to_node.remove(key)?;
+        self.node_to_key.remove(&node_id);
+        Some(node_id)
+    }
+
+    /// Look up the key associated with `node_id`, if any.
+    fn key_for_node(&self, node_id: NodeId) -> Option<&[u8]> {
+        self.node_to_key.get(&node_id).map(|v| v.as_slice())
+    }
+}
+
 struct EngineInner {
     writer: WalWriter,
     memtable: Memtable,
@@ -144,6 +182,11 @@ struct EngineInner {
 
 pub struct Engine {
     inner: Mutex<EngineInner>,
+    /// Vector index, locked separately from the LSM state. Concurrent
+    /// `nearest` queries take only the read side; mutations
+    /// (`put_indexed`, vector-bearing `delete`) take the write side
+    /// and are always acquired *after* the LSM lock to avoid deadlock.
+    vector_index: Arc<RwLock<VectorIndex>>,
     options: Options,
 }
 
@@ -178,35 +221,173 @@ impl Engine {
         // Step 3: open the WAL for append.
         let writer = WalWriter::open(options.io.as_ref(), &wal_path, &options.path)?;
 
+        let inner = EngineInner {
+            writer,
+            memtable,
+            levels,
+            next_sst_id,
+            closed: false,
+        };
+
+        // Build the vector index: snapshot if present and valid, else
+        // full-rebuild from the LSM.
+        let vector_index = recover_vector_index(&inner, &options)?;
+
         Ok(Self {
-            inner: Mutex::new(EngineInner {
-                writer,
-                memtable,
-                levels,
-                next_sst_id,
-                closed: false,
-            }),
+            inner: Mutex::new(inner),
+            vector_index: Arc::new(RwLock::new(vector_index)),
             options,
         })
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut inner = self.lock_inner()?;
-        inner.writer.append(RecordKind::Put, key, value)?;
-        inner.writer.sync()?;
-        inner.memtable.put(key.to_vec(), value.to_vec());
-        inner.maybe_auto_flush(&self.options)?;
-        inner.maybe_compact(&self.options)?;
+        let next_id_after = {
+            let mut inner = self.lock_inner()?;
+            inner.writer.append(RecordKind::Put, key, value)?;
+            inner.writer.sync()?;
+            inner.memtable.put(key.to_vec(), value.to_vec());
+            let before = inner.next_sst_id;
+            inner.maybe_auto_flush(&self.options)?;
+            inner.maybe_compact(&self.options)?;
+            (before != inner.next_sst_id).then_some(inner.next_sst_id)
+        };
+        if let Some(next_id) = next_id_after {
+            self.write_snapshot(next_id)?;
+        }
         Ok(())
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        let mut inner = self.lock_inner()?;
-        inner.writer.append(RecordKind::Delete, key, b"")?;
-        inner.writer.sync()?;
-        inner.memtable.delete(key.to_vec());
-        inner.maybe_auto_flush(&self.options)?;
-        inner.maybe_compact(&self.options)?;
+        // Step 1: LSM.
+        let next_id_after = {
+            let mut inner = self.lock_inner()?;
+            inner.writer.append(RecordKind::Delete, key, b"")?;
+            inner.writer.sync()?;
+            inner.memtable.delete(key.to_vec());
+            let before = inner.next_sst_id;
+            inner.maybe_auto_flush(&self.options)?;
+            inner.maybe_compact(&self.options)?;
+            (before != inner.next_sst_id).then_some(inner.next_sst_id)
+        };
+
+        // Step 2: HNSW (only if the key was indexed).
+        {
+            let mut index = self
+                .vector_index
+                .write()
+                .expect("vector_index lock poisoned");
+            if let Some(node_id) = index.unregister(key) {
+                index.hnsw.delete(node_id)?;
+            }
+        }
+
+        // Step 3: snapshot if the LSM changed shape.
+        if let Some(next_id) = next_id_after {
+            self.write_snapshot(next_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Insert or overwrite `key` with the vector `embedding`.
+    ///
+    /// The vector is serialized as little-endian f32 bytes and
+    /// written to the WAL + memtable like a regular value. A future
+    /// commit wires the HNSW index on top so a subsequent
+    /// `nearest()` finds the key.
+    ///
+    /// Rejects:
+    /// - Empty embeddings (zero-dimension)
+    /// - Embeddings containing non-finite components (NaN or ±inf)
+    pub fn put_indexed(&self, key: &[u8], embedding: &[f32]) -> Result<()> {
+        if embedding.is_empty() {
+            return Err(Error::InvalidArgument(
+                "embedding must have at least one dimension".into(),
+            ));
+        }
+        if !embedding.iter().all(|x| x.is_finite()) {
+            return Err(Error::InvalidArgument(
+                "embedding contains non-finite values (NaN or infinity)".into(),
+            ));
+        }
+
+        // Validate dimension against the established expected_dim
+        // *before* touching the LSM, so a mismatch failure leaves the
+        // engine in a fully consistent state.
+        {
+            let index = self
+                .vector_index
+                .read()
+                .expect("vector_index lock poisoned");
+            if let Some(d) = index.expected_dim
+                && embedding.len() != d
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "embedding dimension {} does not match established \
+                     dimension {d}",
+                    embedding.len()
+                )));
+            }
+        }
+
+        let vector_bytes = encode_vector(embedding);
+
+        // Step 1: persist to LSM. WAL fsync ordering as ever.
+        let next_id_after = {
+            let mut inner = self.lock_inner()?;
+            inner.writer.append(RecordKind::Vector, key, &vector_bytes)?;
+            inner.writer.sync()?;
+            inner.memtable.put_vector(key.to_vec(), vector_bytes);
+            let before = inner.next_sst_id;
+            inner.maybe_auto_flush(&self.options)?;
+            inner.maybe_compact(&self.options)?;
+            (before != inner.next_sst_id).then_some(inner.next_sst_id)
+        };
+
+        // Step 2: update HNSW. LSM lock is now released so concurrent
+        // reads against the LSM don't block on index maintenance.
+        // The dim check at the top already validated the new vector
+        // against any established dim; we re-check here under the
+        // write lock to handle the race where the first insert wins.
+        {
+            let mut index = self
+                .vector_index
+                .write()
+                .expect("vector_index lock poisoned");
+
+            // First-insert path: establish dim now.
+            match index.expected_dim {
+                None => {
+                    index.expected_dim = Some(embedding.len());
+                }
+                Some(d) => {
+                    if embedding.len() != d {
+                        // Lost the race: another put_indexed established
+                        // a different dim between our outer check and here.
+                        return Err(Error::InvalidArgument(format!(
+                            "embedding dimension {} does not match \
+                             established dimension {d}",
+                            embedding.len()
+                        )));
+                    }
+                }
+            }
+
+            // Overwrite path: unregister + delete the old node first.
+            if let Some(old_id) = index.unregister(key) {
+                index.hnsw.delete(old_id)?;
+            }
+
+            // Insert the new node and register both directions.
+            let new_id = index.hnsw.insert(embedding)?;
+            index.register(key.to_vec(), new_id);
+        }
+
+        // Snapshot if the LSM produced a new SSTable as a side effect.
+        if let Some(next_id) = next_id_after {
+            self.write_snapshot(next_id)?;
+        }
+
         Ok(())
     }
 
@@ -247,6 +428,116 @@ impl Engine {
         Ok(None)
     }
 
+    /// Find the `k` approximate nearest neighbors of `query`.
+    ///
+    /// Returns results in ascending distance order (closest first).
+    /// Distance semantics depend on the configured metric: cosine
+    /// returns `1 - cosine_similarity`, Euclidean returns squared
+    /// distance, inner product returns negated similarity.
+    ///
+    /// Returns an empty vector if the index has no live entries or
+    /// if `k == 0`.
+    pub fn nearest(&self, query: &[f32], k: usize) -> Result<Vec<NearestResult>> {
+        let index = self
+            .vector_index
+            .read()
+            .expect("vector_index lock poisoned");
+        let hits = index.hnsw.search(query, k)?;
+
+        // Map NodeIds back to keys via the reverse map (O(1) each).
+        let mut results = Vec::with_capacity(hits.len());
+        for (node_id, distance) in hits {
+            if let Some(key) = index.key_for_node(node_id) {
+                results.push(NearestResult {
+                    key: key.to_vec(),
+                    distance,
+                });
+            }
+        }
+        Ok(results)
+    }
+
+    /// Find the `k` nearest neighbors of `query` whose key satisfies
+    /// `predicate`.
+    ///
+    /// The predicate receives the engine key (not the value). This
+    /// suits metadata-in-key patterns — e.g. keys like
+    /// `user_42:memory_99` filtered by `|k| k.starts_with(b"user_42:")`.
+    ///
+    /// To keep `k` results despite filtering, the search over-queries
+    /// the graph and widens adaptively if too many candidates are
+    /// rejected. A highly selective predicate (one that passes only a
+    /// tiny fraction of vectors) escalates toward an O(N) search,
+    /// since that is the only way to correctly find the `k` nearest
+    /// passing vectors. If fewer than `k` vectors pass the predicate
+    /// in the entire index, all passing vectors are returned.
+    pub fn nearest_filtered<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        predicate: F,
+    ) -> Result<Vec<NearestResult>>
+    where
+        F: Fn(&[u8]) -> bool,
+    {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let index = self
+            .vector_index
+            .read()
+            .expect("vector_index lock poisoned");
+
+        let live = index.hnsw.live_len();
+        if live == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Start with a generously wide search rather than doubling up
+        // from a tight bound: filtered queries usually have moderate
+        // selectivity, so one wide pass typically fills k without the
+        // repeated re-search a 2x-doubling schedule incurs. We still
+        // escalate if even the wide pass underfills (very selective
+        // filter), capped at the live node count.
+        let mut factor = 10usize;
+        loop {
+            let search_k = k.saturating_mul(factor).min(live);
+            let hits = index.hnsw.search(query, search_k)?;
+
+            let mut results = Vec::with_capacity(k);
+            for (node_id, distance) in &hits {
+                if let Some(key) = index.key_for_node(*node_id)
+                    && predicate(key)
+                {
+                    results.push(NearestResult {
+                        key: key.to_vec(),
+                        distance: *distance,
+                    });
+                    if results.len() == k {
+                        break;
+                    }
+                }
+            }
+
+            // Done when we've filled k, or we've already searched the
+            // whole live index (so widening can't find more).
+            if results.len() == k || search_k >= live {
+                return Ok(results);
+            }
+            factor = factor.saturating_mul(2);
+        }
+    }
+
+    /// Number of live vector entries in the index. Test/debug only.
+    #[doc(hidden)]
+    pub fn vector_count(&self) -> usize {
+        let index = self
+            .vector_index
+            .read()
+            .expect("vector_index lock poisoned");
+        index.live_count()
+    }
+
     /// Force the current memtable to disk as a new SSTable, then
     /// rotate the WAL. After this returns successfully, the memtable
     /// is empty and the new SSTable is registered for reads.
@@ -254,9 +545,83 @@ impl Engine {
     /// Also runs compaction if the resulting L0 count crosses the
     /// trigger.
     pub fn flush(&self) -> Result<()> {
-        let mut inner = self.lock_inner()?;
-        inner.flush_inner(&self.options)?;
-        inner.maybe_compact(&self.options)
+        let next_id_after = {
+            let mut inner = self.lock_inner()?;
+            let before = inner.next_sst_id;
+            inner.flush_inner(&self.options)?;
+            inner.maybe_compact(&self.options)?;
+            (before != inner.next_sst_id).then_some(inner.next_sst_id)
+        };
+        if let Some(next_id) = next_id_after {
+            self.write_snapshot(next_id)?;
+        }
+        Ok(())
+    }
+
+    /// Write a fresh HNSW snapshot to disk reflecting the current
+    /// vector-index state. Uses the atomic-rename pattern.
+    ///
+    /// `next_sstable_id` is recorded in the snapshot so recovery can
+    /// determine which on-disk SSTables (if any) post-date the
+    /// snapshot. Pass the engine's current `next_sst_id` (the value
+    /// that would be allocated for the *next* SSTable).
+    ///
+    /// After the new snapshot is durable, this method best-effort
+    /// deletes older `hnsw_*.idx` files in the engine directory. A
+    /// failure to delete is logged but not propagated, since the new
+    /// snapshot is already durable and orphans are harmless (the
+    /// highest-id snapshot wins on recovery).
+    fn write_snapshot(&self, next_sstable_id: u64) -> Result<()> {
+        let bytes = {
+            let index = self
+                .vector_index
+                .read()
+                .expect("vector_index lock poisoned");
+            index
+                .hnsw
+                .encode_snapshot(next_sstable_id, &index.key_to_node)
+        };
+
+        let filename = snapshot_filename(next_sstable_id);
+        let final_path = self.options.path.join(&filename);
+        let tmp_path = self.options.path.join(format!("{filename}.tmp"));
+
+        // Atomic write: write to .tmp, rename, fsync directory.
+        {
+            let mut writer = self.options.io.open_append(&tmp_path)?;
+            writer.append(&bytes)?;
+            writer.sync()?;
+        }
+        self.options.io.rename(&tmp_path, &final_path)?;
+        self.options.io.sync_dir(&self.options.path)?;
+
+        // Best-effort cleanup of older snapshots.
+        match self.options.io.list_dir(&self.options.path) {
+            Ok(entries) => {
+                for path in entries {
+                    if path == final_path {
+                        continue;
+                    }
+                    let Some(other_id) = parse_snapshot_filename(&path) else {
+                        continue;
+                    };
+                    if other_id != next_sstable_id
+                        && let Err(e) = self.options.io.remove_file(&path)
+                    {
+                        warn!(
+                            file = %path.display(),
+                            error = %e,
+                            "failed to remove old HNSW snapshot; will be cleaned up on next open"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to list dir for old-snapshot cleanup");
+            }
+        }
+
+        Ok(())
     }
 
     pub fn close(&self) -> Result<()> {
@@ -515,6 +880,19 @@ fn sst_filename(level: u8, id: u64) -> String {
     format!("sst_L{level}_{id:06}.{SST_EXT}")
 }
 
+/// Filename for an HNSW snapshot at the given sequence id.
+fn snapshot_filename(id: u64) -> String {
+    format!("hnsw_{id:06}.idx")
+}
+
+/// Parse an HNSW snapshot filename to its id, or `None` if the pattern
+/// doesn't match.
+fn parse_snapshot_filename(path: &Path) -> Option<u64> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("hnsw_")?;
+    rest.parse::<u64>().ok()
+}
+
 /// Parse `sst_L<level>_<id>.sst` from a path. Returns `None` if the
 /// filename doesn't match.
 fn parse_sst_filename(path: &Path) -> Option<(u8, u64)> {
@@ -652,6 +1030,7 @@ fn replay_wal(io: &dyn Io, wal_path: &Path, memtable: &mut Memtable) -> Result<(
     while let Some(rec) = reader.next_record()? {
         match rec.kind {
             RecordKind::Put => memtable.put(rec.key, rec.value),
+            RecordKind::Vector => memtable.put_vector(rec.key, rec.value),
             RecordKind::Delete => memtable.delete(rec.key),
         }
         replayed += 1;
@@ -660,4 +1039,288 @@ fn replay_wal(io: &dyn Io, wal_path: &Path, memtable: &mut Memtable) -> Result<(
         warn!("WAL existed but contained zero records");
     }
     Ok(())
+}
+
+/// Bring up the vector index on engine open.
+///
+/// Snapshot path if a valid `hnsw_*.idx` exists: load it and apply
+/// only the post-snapshot delta. Otherwise (missing or corrupt
+/// snapshot) fall back to a full rebuild from the LSM. The snapshot
+/// is a cache; the LSM is the source of truth, so a bad snapshot
+/// never prevents the engine from opening.
+fn recover_vector_index(inner: &EngineInner, options: &Options) -> Result<VectorIndex> {
+    let snapshot_path = discover_latest_snapshot(options.io.as_ref(), &options.path)?;
+
+    match snapshot_path {
+        Some(path) => match load_snapshot_and_apply_delta(inner, options, &path) {
+            Ok(idx) => {
+                info!(path = %path.display(), "loaded HNSW from snapshot");
+                Ok(idx)
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "HNSW snapshot load failed; falling back to full rebuild"
+                );
+                full_rebuild_index_from_lsm(inner, options)
+            }
+        },
+        None => {
+            debug!("no HNSW snapshot present; rebuilding from LSM");
+            full_rebuild_index_from_lsm(inner, options)
+        }
+    }
+}
+
+/// Find the highest-id `hnsw_*.idx` in `dir`, cleaning up any older
+/// orphan snapshots from interrupted writes. Returns `None` if none
+/// exist. `.tmp` files are already removed by `discover_sstables`.
+fn discover_latest_snapshot(io: &dyn Io, dir: &Path) -> Result<Option<PathBuf>> {
+    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
+    for path in io.list_dir(dir)? {
+        if let Some(id) = parse_snapshot_filename(&path) {
+            candidates.push((id, path));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    candidates.sort_by_key(|(id, _)| *id);
+    let (_, latest) = candidates.last().cloned().unwrap();
+    for (id, path) in &candidates[..candidates.len() - 1] {
+        warn!(
+            id,
+            file = %path.display(),
+            "removing orphan HNSW snapshot from interrupted write"
+        );
+        let _ = io.remove_file(path);
+    }
+    Ok(Some(latest))
+}
+
+/// Snapshot-based recovery: deserialize the snapshot, then apply the
+/// memtable + post-snapshot SSTables on top, newest-first, with
+/// overwrite + shadowing semantics matching live `put_indexed`/`delete`.
+fn load_snapshot_and_apply_delta(
+    inner: &EngineInner,
+    options: &Options,
+    snapshot_path: &Path,
+) -> Result<VectorIndex> {
+    let bytes = read_file_fully(options.io.as_ref(), snapshot_path)?;
+    let (hnsw, key_to_node, snapshot_next_sstable_id) =
+        HnswIndex::decode_snapshot(&bytes)?;
+
+    let expected_dim = if hnsw.dim() == 0 {
+        None
+    } else {
+        Some(hnsw.dim())
+    };
+
+    // Build the reverse map from the decoded forward map.
+    let node_to_key: HashMap<NodeId, Vec<u8>> = key_to_node
+        .iter()
+        .map(|(k, &id)| (id, k.clone()))
+        .collect();
+    let mut index = VectorIndex {
+        hnsw,
+        key_to_node,
+        node_to_key,
+        expected_dim,
+    };
+
+    let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+
+    // 1. Memtable (newest).
+    for (key, entry) in inner.memtable.iter() {
+        apply_delta_entry(&mut index, &mut seen_keys, key.to_vec(), entry)?;
+    }
+
+    // 2. SSTables with id >= the snapshot's next_sstable_id, newest
+    //    first so newer writes shadow older ones.
+    let mut delta_ssts: Vec<&SsTableEntry> = inner
+        .levels
+        .l0
+        .iter()
+        .chain(inner.levels.l1.iter())
+        .filter(|e| e.id >= snapshot_next_sstable_id)
+        .collect();
+    delta_ssts.sort_by_key(|e| std::cmp::Reverse(e.id));
+
+    for sst in delta_ssts {
+        for item in sst.reader.iter() {
+            let (key, entry) = item?;
+            apply_delta_entry(&mut index, &mut seen_keys, key, &entry)?;
+        }
+    }
+
+    Ok(index)
+}
+
+/// Apply one delta entry to a (snapshot-loaded) index with overwrite +
+/// shadowing. No-op if the key was already handled by a newer source.
+fn apply_delta_entry(
+    index: &mut VectorIndex,
+    seen_keys: &mut HashSet<Vec<u8>>,
+    key: Vec<u8>,
+    entry: &crate::memtable::Entry,
+) -> Result<()> {
+    if seen_keys.contains(&key) {
+        return Ok(());
+    }
+    seen_keys.insert(key.clone());
+
+    match entry {
+        crate::memtable::Entry::Tombstone => {
+            if let Some(node_id) = index.unregister(&key) {
+                index.hnsw.delete(node_id)?;
+            }
+        }
+        crate::memtable::Entry::Put(_) => {
+            // Newest value is plain bytes, not a vector: drop any
+            // older vector association.
+            if let Some(node_id) = index.unregister(&key) {
+                index.hnsw.delete(node_id)?;
+            }
+        }
+        crate::memtable::Entry::Vector(bytes) => {
+            let embedding = decode_vector(bytes)?;
+            match index.expected_dim {
+                None => index.expected_dim = Some(embedding.len()),
+                Some(d) if d != embedding.len() => {
+                    return Err(Error::Corruption(format!(
+                        "delta vector dim {} != index dim {d}",
+                        embedding.len()
+                    )));
+                }
+                Some(_) => {}
+            }
+            if let Some(old_id) = index.unregister(&key) {
+                index.hnsw.delete(old_id)?;
+            }
+            let new_id = index.hnsw.insert(&embedding)?;
+            index.register(key, new_id);
+        }
+    }
+    Ok(())
+}
+
+/// Read an entire file through the Io trait into a byte vector.
+fn read_file_fully(io: &dyn Io, path: &Path) -> Result<Vec<u8>> {
+    let file = io.open_read(path)?;
+    let len = file.len()?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_at(0, &mut buf)?;
+    Ok(buf)
+}
+
+/// Full-walk fallback: build the index from scratch using the LSM as
+/// the source of truth. Newest-first with shadowing.
+fn full_rebuild_index_from_lsm(
+    inner: &EngineInner,
+    options: &Options,
+) -> Result<VectorIndex> {
+    let mut index = VectorIndex::new(options.hnsw_params.clone());
+    let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+
+    // Memtable first (newest source).
+    for (key, entry) in inner.memtable.iter() {
+        let key_vec = key.to_vec();
+        if seen_keys.contains(&key_vec) {
+            continue;
+        }
+        match entry {
+            crate::memtable::Entry::Tombstone => {
+                seen_keys.insert(key_vec);
+            }
+            crate::memtable::Entry::Vector(bytes) => {
+                seen_keys.insert(key_vec.clone());
+                insert_into_index(&mut index, key_vec, bytes)?;
+            }
+            crate::memtable::Entry::Put(_) => {
+                seen_keys.insert(key_vec);
+            }
+        }
+    }
+    // L0 newest-first.
+    for entry in inner.levels.l0.iter() {
+        ingest_sstable_into_fresh_index(entry.reader.as_ref(), &mut index, &mut seen_keys)?;
+    }
+    // L1.
+    for entry in inner.levels.l1.iter() {
+        ingest_sstable_into_fresh_index(entry.reader.as_ref(), &mut index, &mut seen_keys)?;
+    }
+    Ok(index)
+}
+
+fn ingest_sstable_into_fresh_index(
+    reader: &SsTableReader,
+    index: &mut VectorIndex,
+    seen_keys: &mut HashSet<Vec<u8>>,
+) -> Result<()> {
+    for item in reader.iter() {
+        let (key, entry) = item?;
+        if seen_keys.contains(&key) {
+            continue;
+        }
+        match entry {
+            crate::memtable::Entry::Tombstone => {
+                seen_keys.insert(key);
+            }
+            crate::memtable::Entry::Vector(bytes) => {
+                seen_keys.insert(key.clone());
+                insert_into_index(index, key, &bytes)?;
+            }
+            crate::memtable::Entry::Put(_) => {
+                seen_keys.insert(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_into_index(index: &mut VectorIndex, key: Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let embedding = decode_vector(bytes)?;
+    if let Some(d) = index.expected_dim {
+        if d != embedding.len() {
+            return Err(Error::Corruption(format!(
+                "vector entry dim mismatch during index rebuild: \
+                 stored {} but expected {d}",
+                embedding.len()
+            )));
+        }
+    } else {
+        index.expected_dim = Some(embedding.len());
+    }
+    let node_id = index.hnsw.insert(&embedding)?;
+    index.register(key, node_id);
+    Ok(())
+}
+
+/// Decode a little-endian f32 byte vector.
+fn decode_vector(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::Corruption(format!(
+            "vector byte length {} is not a multiple of 4",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().unwrap();
+        out.push(f32::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
+/// Encode a slice of `f32` into a `Vec<u8>` in little-endian order.
+/// Used to store vectors in entries that ultimately go through the
+/// WAL and SSTable byte-oriented APIs. The reverse operation lives
+/// next to the (future) `nearest` API.
+fn encode_vector(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for &x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
 }
